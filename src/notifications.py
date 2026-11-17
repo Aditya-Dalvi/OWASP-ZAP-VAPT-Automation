@@ -1,0 +1,193 @@
+"""Email and Google Chat report delivery."""
+from __future__ import annotations
+
+import csv
+import html
+import io
+import json
+import logging
+import smtplib
+from datetime import datetime
+from email import encoders
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from pathlib import Path
+from urllib.parse import urlparse, urlunsplit
+
+import requests
+
+from .config import settings
+
+log = logging.getLogger("vapt")
+
+
+def safe_hostname(target_url: str) -> str:
+    host = urlparse(target_url).hostname or "target"
+    host = host.removeprefix("www.")
+    return "".join(c if c.isalnum() or c in "-." else "_" for c in host)
+
+
+def safe_target_display(target_url: str) -> str:
+    """Drop query strings and fragments before placing a target in notifications."""
+    parsed = urlparse(target_url)
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+
+
+CSV_COLUMNS = [
+    "pluginId", "alert", "name", "riskcode", "confidence", "riskdesc",
+    "desc", "uri", "param", "attack", "evidence", "solution", "reference",
+    "cweid", "wascid", "sourceid", "messageId", "inputVector", "tags",
+]
+
+
+def build_alert_stats(alerts: list[dict]) -> dict:
+    labels = {"3": "High", "2": "Medium", "1": "Low", "0": "Informational"}
+    instance_counts = {key: 0 for key in labels}
+    unique_plugins: dict[str, str] = {}
+    for alert in alerts:
+        risk = str(alert.get("riskcode", "0"))
+        if risk not in labels:
+            risk = "0"
+        plugin_id = str(alert.get("pluginId", alert.get("id", alert.get("name", "unknown"))))
+        instance_counts[risk] += 1
+        unique_plugins.setdefault(plugin_id, risk)
+    vuln_counts = {key: 0 for key in labels}
+    for risk in unique_plugins.values():
+        vuln_counts[risk] += 1
+    return {
+        "total_instances": len(alerts),
+        "total_vulns": len(unique_plugins),
+        "vuln_by_risk": vuln_counts,
+        "instance_by_risk": instance_counts,
+        "risk_labels": labels,
+    }
+
+
+def build_csv_bytes(alerts: list[dict]) -> bytes:
+    output = io.StringIO()
+    writer = csv.DictWriter(output, fieldnames=CSV_COLUMNS, extrasaction="ignore")
+    writer.writeheader()
+    for alert in alerts:
+        writer.writerow({
+            key: json.dumps(alert.get(key), ensure_ascii=False)
+            if isinstance(alert.get(key), (dict, list)) else alert.get(key, "")
+            for key in CSV_COLUMNS
+        })
+    return output.getvalue().encode("utf-8")
+
+
+def _attachment(msg: MIMEMultipart, data: bytes, filename: str) -> None:
+    part = MIMEBase("application", "octet-stream")
+    part.set_payload(data)
+    encoders.encode_base64(part)
+    part.add_header("Content-Disposition", "attachment", filename=filename)
+    msg.attach(part)
+
+
+def _send_email(recipients: tuple[str, ...], subject: str, body_html: str,
+                attachments: list[tuple[str, bytes]]) -> bool:
+    if not recipients:
+        log.warning("No recipients configured; skipping email group: %s", subject)
+        return False
+    if not settings.smtp_user or not settings.smtp_pass:
+        log.warning("SMTP credentials are not configured; skipping email.")
+        return False
+
+    message = MIMEMultipart("mixed")
+    message["From"] = settings.smtp_user
+    message["To"] = ", ".join(recipients)
+    message["Subject"] = subject
+    alternative = MIMEMultipart("alternative")
+    alternative.attach(MIMEText("Please view this email in an HTML-capable client.", "plain"))
+    alternative.attach(MIMEText(body_html, "html"))
+    message.attach(alternative)
+    for filename, content in attachments:
+        _attachment(message, content, filename)
+
+    try:
+        with smtplib.SMTP(settings.smtp_host, settings.smtp_port, timeout=20) as server:
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+            server.login(settings.smtp_user, settings.smtp_pass)
+            server.sendmail(settings.smtp_user, list(recipients), message.as_string())
+        log.info("Email report sent to %s", ", ".join(recipients))
+        return True
+    except Exception:
+        log.exception("Email report delivery failed.")
+        return False
+
+
+def _email_body(target: str, scan_type: str, timestamp: str,
+                alert_count: int, filenames: list[str]) -> str:
+    rows = "".join(f"<li>{html.escape(name)}</li>" for name in filenames)
+    return f"""<!doctype html><html><body style="font-family:Arial,sans-serif;color:#333">
+    <h2>OWASP ZAP VAPT Scan Report</h2>
+    <table>
+      <tr><td><b>Target</b></td><td>{html.escape(target)}</td></tr>
+      <tr><td><b>Scan type</b></td><td>{html.escape(scan_type)}</td></tr>
+      <tr><td><b>Timestamp</b></td><td>{html.escape(timestamp)}</td></tr>
+      <tr><td><b>Vulnerable instances</b></td><td>{alert_count}</td></tr>
+    </table><p><b>Attached reports</b></p><ul>{rows}</ul>
+    <p>Generated by OWASP ZAP VAPT Automation.</p></body></html>"""
+
+
+def notify_email(target: str, scan_type: str, timestamp: str, date_str: str,
+                 reports: dict[str, bytes], alert_count: int) -> dict[str, bool]:
+    host = safe_hostname(target)
+    names = {ext: f"{host}_{timestamp}.{ext}" for ext in ("html", "csv", "xml", "json")}
+    group1 = [("html", reports["html"]), ("csv", reports["csv"])]
+    group2 = [(ext, reports[ext]) for ext in ("html", "csv", "xml", "json")]
+    results = {}
+    for group_name, recipients, selected in (
+        ("html-csv", settings.email_html_csv, group1),
+        ("all-reports", settings.email_all_files, group2),
+    ):
+        attachments = [(names[ext], data) for ext, data in selected]
+        subject = f"Internal VAPT - {host} {date_str}" + (" ALL REPORTS" if group_name == "all-reports" else "")
+        body = _email_body(safe_target_display(target), scan_type, timestamp, alert_count, [name for name, _ in attachments])
+        results[group_name] = _send_email(recipients, subject, body, attachments)
+    return results
+
+
+def notify_gchat(message: str) -> bool:
+    if not settings.gchat_webhook:
+        log.info("Google Chat webhook not configured; skipping notification.")
+        return False
+    if not settings.gchat_webhook.startswith("https://"):
+        log.error("Google Chat webhook must use HTTPS; notification skipped.")
+        return False
+    try:
+        response = requests.post(settings.gchat_webhook, json={"text": message}, timeout=10)
+        response.raise_for_status()
+        return True
+    except requests.RequestException as exc:
+        # Do not log the exception text: HTTP client errors can include the
+        # webhook URL, which contains a secret token.
+        log.error("Google Chat notification failed (%s).", type(exc).__name__)
+        return False
+
+
+def scan_started(target: str, scan_type: str, started: datetime) -> None:
+    notify_gchat(
+        "🚀 VAPT Scan Started\n"
+        f"Application: {safe_hostname(target)}\nTarget: {safe_target_display(target)}\n"
+        f"Scan Type: {scan_type}\nStart: {started:%d-%m-%Y %H:%M:%S}"
+    )
+
+
+def scan_completed(target: str, scan_type: str, started: datetime, ended: datetime,
+                   stats: dict, report_time: datetime) -> None:
+    duration = int((ended - started).total_seconds())
+    mins, secs = divmod(duration, 60)
+    risk = stats["vuln_by_risk"]
+    highest = "High" if risk["3"] else "Medium" if risk["2"] else "Low" if risk["1"] else "Informational" if risk["0"] else "None"
+    notify_gchat(
+        "✅ VAPT Assessment Completed\n"
+        f"Application: {safe_hostname(target)}\nTarget: {safe_target_display(target)}\nScan Type: {scan_type}\n"
+        f"Start: {started:%d-%m-%Y %H:%M:%S}\nEnd: {ended:%d-%m-%Y %H:%M:%S}\n"
+        f"Duration: {mins}m {secs}s\nUnique vulnerabilities: {stats['total_vulns']}\n"
+        f"Instances: {stats['total_instances']}\nHighest risk: {highest}\n"
+        f"Reports dispatched: {report_time:%d-%m-%Y %H:%M:%S}"
+    )
